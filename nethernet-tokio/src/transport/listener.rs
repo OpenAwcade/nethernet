@@ -202,6 +202,17 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         let description = Description::parse(&signal.data)
             .map_err(|e| (Some(SignalErrorCode::FailedToSetRemoteDescription), e))?;
 
+        // Register the per-connection dispatcher before gathering candidates:
+        // vanilla clients signal CANDIDATEADD immediately after CONNECTREQUEST,
+        let connection_id = signal.connection_id;
+        let network_id = signal.network_id.clone();
+        let key = (network_id.clone(), connection_id);
+        let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
+        signal_dispatchers
+            .lock()
+            .await
+            .insert(key.clone(), signal_tx);
+
         let credentials = signaling
             .credentials()
             .await
@@ -229,16 +240,6 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             )
             .and_then(|description| description.encode())
             .map_err(|e| (Some(SignalErrorCode::FailedToCreateAnswer), e))?;
-
-        let connection_id = signal.connection_id;
-        let network_id = signal.network_id;
-        let key = (network_id.clone(), connection_id);
-
-        let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
-        signal_dispatchers
-            .lock()
-            .await
-            .insert(key.clone(), signal_tx);
 
         signaling
             .signal(Signal::answer(connection_id, answer, network_id.clone()))
