@@ -4,7 +4,9 @@ use crate::protocol::constants::DEFAULT_PACKET_CHANNEL_CAPACITY;
 use crate::protocol::{Message, MessageSegment};
 use bytes::Bytes;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use std::sync::RwLock as StdRwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing;
 use webrtc::data_channel::RTCDataChannel;
@@ -74,15 +76,15 @@ pub struct Session {
     sctp: Arc<RTCSctpTransport>,
     local: Addr,
     remote: Arc<Mutex<Addr>>,
-    reliable_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
-    unreliable_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    reliable_channel: StdRwLock<Option<Arc<RTCDataChannel>>>,
+    unreliable_channel: StdRwLock<Option<Arc<RTCDataChannel>>>,
     message_buffer: Arc<Mutex<Message>>,
     unreliable_buffer: Arc<Mutex<Message>>,
     packet_tx: mpsc::Sender<Bytes>,
     packet_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
     unreliable_tx: mpsc::Sender<Bytes>,
     unreliable_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    closed: Arc<RwLock<bool>>,
+    closed: AtomicBool,
     close_token: CancellationToken,
 }
 
@@ -126,15 +128,15 @@ impl Session {
             sctp,
             local,
             remote: Arc::new(Mutex::new(remote)),
-            reliable_channel: Arc::new(Mutex::new(None)),
-            unreliable_channel: Arc::new(Mutex::new(None)),
+            reliable_channel: StdRwLock::new(None),
+            unreliable_channel: StdRwLock::new(None),
             message_buffer: Arc::new(Mutex::new(Message::new())),
             unreliable_buffer: Arc::new(Mutex::new(Message::new())),
             packet_tx,
             packet_rx: Arc::new(Mutex::new(packet_rx)),
             unreliable_tx,
             unreliable_rx: Arc::new(Mutex::new(unreliable_rx)),
-            closed: Arc::new(RwLock::new(false)),
+            closed: AtomicBool::new(false),
             close_token: CancellationToken::new(),
         }
     }
@@ -149,7 +151,7 @@ impl Session {
             self.packet_tx.clone(),
         );
 
-        *self.reliable_channel.lock().await = Some(channel);
+        *self.reliable_channel.write().unwrap_or_else(|e| e.into_inner()) = Some(channel);
         Ok(())
     }
 
@@ -164,7 +166,7 @@ impl Session {
             self.unreliable_tx.clone(),
         );
 
-        *self.unreliable_channel.lock().await = Some(channel);
+        *self.unreliable_channel.write().unwrap_or_else(|e| e.into_inner()) = Some(channel);
         Ok(())
     }
 
@@ -176,12 +178,12 @@ impl Session {
     /// - Returns `NethernetError::DataChannel(...)` if the reliable channel is not set or if sending a segment fails.
     /// - Returns any error produced by `Message::split_into_segments` when segmenting the input.
     pub async fn send(&self, data: Bytes) -> Result<()> {
-        if *self.closed.read().await {
+        if self.closed.load(Ordering::Acquire) {
             return Err(NethernetError::ConnectionClosed);
         }
 
         let channel = {
-            let guard = self.reliable_channel.lock().await;
+            let guard = self.reliable_channel.read().unwrap_or_else(|e| e.into_inner());
             guard
                 .as_ref()
                 .ok_or_else(|| NethernetError::DataChannel("Reliable channel not set".to_string()))?
@@ -211,12 +213,12 @@ impl Session {
     /// Data sent over a channel that was opened out of band is dropped by remote
     /// connections that did not open the matching channel themselves.
     pub async fn send_unreliable(&self, data: Bytes) -> Result<()> {
-        if *self.closed.read().await {
+        if self.closed.load(Ordering::Acquire) {
             return Err(NethernetError::ConnectionClosed);
         }
 
         let channel = {
-            let guard = self.unreliable_channel.lock().await;
+            let guard = self.unreliable_channel.read().unwrap_or_else(|e| e.into_inner());
             guard
                 .as_ref()
                 .ok_or_else(|| {
@@ -238,7 +240,7 @@ impl Session {
     ///
     /// Returns `Ok(None)` once the session has been closed.
     pub async fn recv_unreliable(&self) -> Result<Option<Bytes>> {
-        if *self.closed.read().await {
+        if self.closed.load(Ordering::Acquire) {
             return Ok(None);
         }
 
@@ -251,7 +253,7 @@ impl Session {
     /// segment stream. If the session has been closed, or the underlying packet
     /// channel has been closed, this returns `Ok(None)`.
     pub async fn recv(&self) -> Result<Option<Bytes>> {
-        if *self.closed.read().await {
+        if self.closed.load(Ordering::Acquire) {
             return Ok(None);
         }
 
@@ -264,22 +266,26 @@ impl Session {
     ///
     /// After this call the session is considered closed; calling `close` again is a no-op.
     pub async fn close(&self) -> Result<()> {
-        let mut closed = self.closed.write().await;
-        if *closed {
+        if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        *closed = true;
-        drop(closed);
 
         self.close_token.cancel();
 
-        // Acquire lock, clone the channel, drop the lock, then close
-        let reliable = self.reliable_channel.lock().await.clone();
+        let reliable = self
+            .reliable_channel
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some(channel) = reliable {
             let _ = channel.close().await;
         }
 
-        let unreliable = self.unreliable_channel.lock().await.clone();
+        let unreliable = self
+            .unreliable_channel
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some(channel) = unreliable {
             let _ = channel.close().await;
         }
@@ -352,6 +358,6 @@ impl Session {
 
     /// Reports whether the session has been closed.
     pub async fn is_closed(&self) -> bool {
-        *self.closed.read().await
+        self.closed.load(Ordering::Acquire)
     }
 }
