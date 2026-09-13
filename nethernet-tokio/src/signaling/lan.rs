@@ -32,6 +32,11 @@ pub struct LanConfig {
 
     /// Time an address of a remote network is kept after its last packet.
     pub address_timeout: Duration,
+
+    /// Accept `MessagePacket`s addressed to any recipient, not just this
+    /// node's own network id. Needed when one socket advertises several
+    /// servers (each with its own sender id).
+    pub accept_any_recipient: bool,
 }
 
 impl Default for LanConfig {
@@ -41,6 +46,7 @@ impl Default for LanConfig {
             broadcast_address: None,
             broadcast_interval: Duration::from_secs(2),
             address_timeout: Duration::from_secs(15),
+            accept_any_recipient: false,
         }
     }
 }
@@ -58,6 +64,7 @@ pub struct LanSignaling {
     signal_tx: broadcast::Sender<Signal>,
     server_data: Arc<RwLock<Option<ServerData>>>,
     discovered_servers: Arc<AsyncRwLock<HashMap<u64, ServerData>>>,
+    join_targets: Arc<AsyncRwLock<HashMap<u64, u64>>>,
     cancel_token: CancellationToken,
     background_task: Option<JoinHandle<()>>,
 }
@@ -89,7 +96,20 @@ impl LanSignaling {
         config: LanConfig,
     ) -> Result<Self> {
         let socket = UdpSocket::bind(bind_addr).await?;
+        Self::with_socket(network_id, socket, config).await
+    }
+
+    /// Creates and starts a new LanSignaling instance on a pre-bound socket.
+    ///
+    /// Lets the caller control bind semantics (socket options, shared sockets);
+    /// broadcast is enabled on the socket here.
+    pub async fn with_socket(
+        network_id: u64,
+        socket: UdpSocket,
+        config: LanConfig,
+    ) -> Result<Self> {
         socket.set_broadcast(true)?;
+        let bind_addr = socket.local_addr()?;
 
         // Use broadcast channel for fan-out to multiple subscribers
         // Capacity of 100 should be sufficient for signal buffering
@@ -111,6 +131,7 @@ impl LanSignaling {
         let addresses = Arc::new(AsyncRwLock::new(HashMap::new()));
         let server_data = Arc::new(RwLock::new(None));
         let discovered_servers = Arc::new(AsyncRwLock::new(HashMap::new()));
+        let join_targets = Arc::new(AsyncRwLock::new(HashMap::new()));
 
         let background_task = Self::start_background_task(
             network_id,
@@ -119,6 +140,7 @@ impl LanSignaling {
             signal_tx.clone(),
             server_data.clone(),
             discovered_servers.clone(),
+            join_targets.clone(),
             broadcast_addr,
             cancel_token.clone(),
             config,
@@ -131,6 +153,7 @@ impl LanSignaling {
             signal_tx,
             server_data,
             discovered_servers,
+            join_targets,
             cancel_token,
             background_task: Some(background_task),
         };
@@ -152,6 +175,18 @@ impl LanSignaling {
         if let Some(task) = self.background_task.take() {
             let _ = task.await;
         }
+    }
+
+    /// Returns the shared UDP socket used for LAN signaling I/O.
+    pub fn socket(&self) -> Arc<UdpSocket> {
+        self.socket.clone()
+    }
+
+    /// Returns the advertised recipient id a CONNECTREQUEST offer was
+    /// addressed to, if the offer targeted an advertised server rather than
+    /// this node's own network id.
+    pub async fn join_target(&self, connection_id: u64) -> Option<u64> {
+        self.join_targets.read().await.get(&connection_id).copied()
     }
 
     /// Sets the server data advertised in response to discovery requests.
@@ -186,6 +221,7 @@ impl LanSignaling {
         signal_tx: broadcast::Sender<Signal>,
         server_data: Arc<RwLock<Option<ServerData>>>,
         discovered_servers: Arc<AsyncRwLock<HashMap<u64, ServerData>>>,
+        join_targets: Arc<AsyncRwLock<HashMap<u64, u64>>>,
         broadcast_addr: Option<SocketAddr>,
         cancel_token: CancellationToken,
         config: LanConfig,
@@ -211,6 +247,8 @@ impl LanSignaling {
                                     &socket,
                                     &server_data,
                                     &discovered_servers,
+                                    &join_targets,
+                                    config.accept_any_recipient,
                                 ).await;
                             }
                             Err(e) => {
@@ -265,6 +303,8 @@ impl LanSignaling {
         socket: &Arc<UdpSocket>,
         server_data: &Arc<RwLock<Option<ServerData>>>,
         discovered_servers: &Arc<AsyncRwLock<HashMap<u64, ServerData>>>,
+        join_targets: &Arc<AsyncRwLock<HashMap<u64, u64>>>,
+        accept_any_recipient: bool,
     ) -> Result<()> {
         // Unmarshal the encrypted packet
         let (packet, sender_id) = match discovery::unmarshal(data) {
@@ -362,14 +402,23 @@ impl LanSignaling {
                     return Ok(());
                 }
 
-                // Only process WebRTC signals if message is for us
-                if message.recipient_id == own_network_id {
+                // Process WebRTC signals addressed to us or to any server we
+                // advertise (their sender ids may differ from our network id)
+                if message.recipient_id == own_network_id || accept_any_recipient {
                     tracing::debug!(
                         "Received WebRTC signal from network_id: {} (recipient: {})",
                         sender_id,
                         message.recipient_id
                     );
                     if let Ok(signal) = Signal::from_string(&message.data, sender_id.to_string()) {
+                        if signal.signal_type == crate::protocol::SignalType::Offer
+                            && message.recipient_id != own_network_id
+                        {
+                            join_targets
+                                .write()
+                                .await
+                                .insert(signal.connection_id, message.recipient_id);
+                        }
                         let _ = signal_tx.send(signal);
                     }
                 } else {
@@ -438,7 +487,19 @@ impl Signaling for LanSignaling {
 
         let signal_str = signal.to_string();
         let message = MessagePacket::new(network_id, signal_str);
-        let data = discovery::marshal(&message, self.network_id)?;
+
+        // When answering a connection that the game initiated toward an
+        // advertised server (recipient != our network id), impersonate that
+        // advertised server id as the sender. The game correlates responses
+        // by sender id and drops answers from unknown senders.
+        let sender = self
+            .join_targets
+            .read()
+            .await
+            .get(&signal.connection_id)
+            .copied()
+            .unwrap_or(self.network_id);
+        let data = discovery::marshal(&message, sender)?;
 
         self.socket.send_to(&data, addr).await?;
         Ok(())
