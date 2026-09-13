@@ -10,7 +10,7 @@ use crate::protocol::types::{
 use std::io::Cursor;
 
 /// Current version of ServerData supported by the discovery module.
-const VERSION: u8 = 4;
+const VERSION: u8 = 6;
 
 /// ServerData defines the binary structure representing worlds in Minecraft: Bedrock Edition.
 #[derive(Debug, Clone)]
@@ -29,6 +29,13 @@ pub struct ServerData {
     pub editor_world: bool,
     /// Whether hardcore mode is enabled
     pub hardcore: bool,
+    /// Unknown flag introduced in v6 (observed as `1` on vanilla worlds).
+    pub flag_a: bool,
+    /// Unknown flag introduced in v6 (observed as `1` on vanilla worlds).
+    pub flag_b: bool,
+    /// Session identifier string introduced in v6; a 16-character lowercase
+    /// hex string on vanilla worlds.
+    pub session_id: String,
     /// Transport layer (2 = NetherNet)
     pub transport_layer: u8,
     /// Connection type (4 = LAN)
@@ -58,6 +65,9 @@ impl ServerData {
             max_player_count: 8,
             editor_world: false,
             hardcore: false,
+            flag_a: true,
+            flag_b: true,
+            session_id: String::new(),
             transport_layer: 2, // NetherNet
             connection_type: 4, // LAN
         }
@@ -92,6 +102,9 @@ impl ServerData {
             max_player_count: parts[5].parse().unwrap_or(0),
             editor_world: false,
             hardcore: false,
+            flag_a: true,
+            flag_b: true,
+            session_id: String::new(),
             transport_layer: 2,
             connection_type: 4,
         })
@@ -139,6 +152,11 @@ impl ServerData {
         // Write booleans
         write_u8(&mut buf, if self.editor_world { 1 } else { 0 })?;
         write_u8(&mut buf, if self.hardcore { 1 } else { 0 })?;
+        write_u8(&mut buf, if self.flag_a { 1 } else { 0 })?;
+        write_u8(&mut buf, if self.flag_b { 1 } else { 0 })?;
+
+        // Write session identifier (u8-prefixed string, v6+)
+        write_bytes_u8(&mut buf, self.session_id.as_bytes())?;
 
         // Write transport layer and connection type (both shifted left by 1)
         write_u8(&mut buf, self.transport_layer << 1)?;
@@ -186,6 +204,13 @@ impl ServerData {
         // Read booleans
         let editor_world = read_u8(&mut cursor)? != 0;
         let hardcore = read_u8(&mut cursor)? != 0;
+        let flag_a = read_u8(&mut cursor)? != 0;
+        let flag_b = read_u8(&mut cursor)? != 0;
+
+        // Read session identifier (u8-prefixed string, v6+)
+        let session_id_bytes = read_bytes_u8(&mut cursor)?;
+        let session_id = String::from_utf8(session_id_bytes)
+            .map_err(|e| NethernetError::Other(format!("invalid session id UTF-8: {}", e)))?;
 
         // Read transport layer and connection type (both shift right by 1)
         let transport_layer = read_u8(&mut cursor)? >> 1;
@@ -205,6 +230,9 @@ impl ServerData {
             max_player_count,
             editor_world,
             hardcore,
+            flag_a,
+            flag_b,
+            session_id,
             transport_layer,
             connection_type,
         })
@@ -235,6 +263,9 @@ mod tests {
             max_player_count: 10,
             editor_world: false,
             hardcore: false,
+            flag_a: true,
+            flag_b: true,
+            session_id: "97231188cae9fed6".to_string(),
             transport_layer: 2,
             connection_type: 4,
         };
@@ -249,6 +280,9 @@ mod tests {
         assert_eq!(original.max_player_count, decoded.max_player_count);
         assert_eq!(original.editor_world, decoded.editor_world);
         assert_eq!(original.hardcore, decoded.hardcore);
+        assert_eq!(original.flag_a, decoded.flag_a);
+        assert_eq!(original.flag_b, decoded.flag_b);
+        assert_eq!(original.session_id, decoded.session_id);
         assert_eq!(original.transport_layer, decoded.transport_layer);
         assert_eq!(original.connection_type, decoded.connection_type);
     }
