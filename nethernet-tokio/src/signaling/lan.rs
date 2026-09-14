@@ -63,14 +63,21 @@ pub struct LanSignaling {
     /// Broadcast sender for fan-out signal distribution to multiple subscribers
     signal_tx: broadcast::Sender<Signal>,
     server_data: Arc<RwLock<Option<ServerData>>>,
-    discovered_servers: Arc<AsyncRwLock<HashMap<u64, ServerData>>>,
+    discovered_servers: Arc<AsyncRwLock<HashMap<u64, DiscoveredServer>>>,
     join_targets: Arc<AsyncRwLock<HashMap<u64, u64>>>,
+    address_timeout: Duration,
     cancel_token: CancellationToken,
     background_task: Option<JoinHandle<()>>,
 }
 
 struct AddressEntry {
     addr: SocketAddr,
+    last_seen: Instant,
+}
+
+/// A discovered server together with the time its last advertisement was seen.
+struct DiscoveredServer {
+    data: ServerData,
     last_seen: Instant,
 }
 
@@ -125,6 +132,7 @@ impl LanSignaling {
             None => None,
         };
 
+        let address_timeout = config.address_timeout;
         let cancel_token = CancellationToken::new();
 
         let socket = Arc::new(socket);
@@ -154,6 +162,7 @@ impl LanSignaling {
             server_data,
             discovered_servers,
             join_targets,
+            address_timeout,
             cancel_token,
             background_task: Some(background_task),
         };
@@ -196,9 +205,24 @@ impl LanSignaling {
 
     /// Returns a snapshot of discovered servers keyed by their network ID.
     ///
-    /// Clones and returns the current internal map of discovered `ServerData` entries.
+    /// Entries whose last advertisement is older than the configured address
+    /// timeout are omitted; the background task removes them periodically.
     pub async fn discover(&self) -> HashMap<u64, ServerData> {
-        self.discovered_servers.read().await.clone()
+        self.discovered_servers
+            .read()
+            .await
+            .iter()
+            .filter(|(_, entry)| entry.last_seen.elapsed() < self.address_timeout)
+            .map(|(id, entry)| (*id, entry.data.clone()))
+            .collect()
+    }
+
+    /// Clears all discovered servers.
+    ///
+    /// Useful right before sending a targeted probe so that only fresh
+    /// responses are taken into account.
+    pub async fn clear_discovered(&self) {
+        self.discovered_servers.write().await.clear();
     }
 
     /// Return the last-known socket address for the given network ID, if any.
@@ -220,7 +244,7 @@ impl LanSignaling {
         addresses: Arc<AsyncRwLock<HashMap<u64, AddressEntry>>>,
         signal_tx: broadcast::Sender<Signal>,
         server_data: Arc<RwLock<Option<ServerData>>>,
-        discovered_servers: Arc<AsyncRwLock<HashMap<u64, ServerData>>>,
+        discovered_servers: Arc<AsyncRwLock<HashMap<u64, DiscoveredServer>>>,
         join_targets: Arc<AsyncRwLock<HashMap<u64, u64>>>,
         broadcast_addr: Option<SocketAddr>,
         cancel_token: CancellationToken,
@@ -259,10 +283,19 @@ impl LanSignaling {
                     }
                     _ = interval.tick() => {
                         Self::cleanup_addresses(&addresses, config.address_timeout).await;
+                        Self::cleanup_discovered(&discovered_servers, config.address_timeout).await;
 
                         // Send broadcast request if client
                         if let Some(addr) = broadcast_addr {
                             let _ = Self::send_request(&socket, network_id, addr).await;
+                            // Some sandboxed/containerized environments do not
+                            // route 255.255.255.255 back into the local network
+                            // namespace. The loopback copy preserves discovery
+                            // for same-host peers without changing LAN behavior.
+                            let loopback = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), addr.port());
+                            if loopback != addr {
+                                let _ = Self::send_request(&socket, network_id, loopback).await;
+                            }
                         }
                     }
                 }
@@ -302,7 +335,7 @@ impl LanSignaling {
         signal_tx: &broadcast::Sender<Signal>,
         socket: &Arc<UdpSocket>,
         server_data: &Arc<RwLock<Option<ServerData>>>,
-        discovered_servers: &Arc<AsyncRwLock<HashMap<u64, ServerData>>>,
+        discovered_servers: &Arc<AsyncRwLock<HashMap<u64, DiscoveredServer>>>,
         join_targets: &Arc<AsyncRwLock<HashMap<u64, u64>>>,
         accept_any_recipient: bool,
     ) -> Result<()> {
@@ -380,10 +413,13 @@ impl LanSignaling {
                     })?;
 
                 if let Ok(server_info) = ServerData::unmarshal(&response.application_data) {
-                    discovered_servers
-                        .write()
-                        .await
-                        .insert(sender_id, server_info);
+                    discovered_servers.write().await.insert(
+                        sender_id,
+                        DiscoveredServer {
+                            data: server_info,
+                            last_seen: Instant::now(),
+                        },
+                    );
                 }
             }
             constants::ID_MESSAGE_PACKET => {
@@ -447,6 +483,18 @@ impl LanSignaling {
     ) {
         let mut addrs = addresses.write().await;
         addrs.retain(|_, entry| entry.last_seen.elapsed() < timeout);
+    }
+
+    /// Removes discovered servers whose last advertisement is older than the timeout.
+    ///
+    /// Without this the map would grow forever and stale entries could be
+    /// mistaken for a currently running game.
+    async fn cleanup_discovered(
+        discovered_servers: &Arc<AsyncRwLock<HashMap<u64, DiscoveredServer>>>,
+        timeout: Duration,
+    ) {
+        let mut servers = discovered_servers.write().await;
+        servers.retain(|_, entry| entry.last_seen.elapsed() < timeout);
     }
 }
 
