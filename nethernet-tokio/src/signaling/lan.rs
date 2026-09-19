@@ -31,6 +31,7 @@ enum Command {
     SetServerData(Box<ServerData>),
     Discovered(oneshot::Sender<HashMap<u64, ServerData>>),
     Address(u64, oneshot::Sender<Option<SocketAddr>>),
+    JoinTarget(u64, oneshot::Sender<Option<u64>>),
 }
 
 /// LAN discovery signaling for a single NetherNet network.
@@ -118,6 +119,16 @@ impl LanSignaling {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
             .send(Command::Address(network_id, reply_tx))
+            .ok()?;
+        reply_rx.await.ok().flatten()
+    }
+
+    /// The advertised recipient id a CONNECTREQUEST offer was addressed to, if the
+    /// offer targeted an advertised server rather than this node's own network id.
+    pub async fn join_target(&self, connection_id: u64) -> Option<u64> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(Command::JoinTarget(connection_id, reply_tx))
             .ok()?;
         reply_rx.await.ok().flatten()
     }
@@ -217,6 +228,9 @@ impl LanSignaling {
                         }
                         Some(Command::Address(network_id, reply)) => {
                             let _ = reply.send(addresses.get(&network_id).copied());
+                        }
+                        Some(Command::JoinTarget(connection_id, reply)) => {
+                            let _ = reply.send(signaler.join_target(connection_id));
                         }
                         None => break,
                     },

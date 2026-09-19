@@ -28,6 +28,11 @@ pub struct LanSignalerConfig {
 
     /// How often a signal is retransmitted before it is given up on.
     pub signal_retries: u32,
+
+    /// Accept `MessagePacket`s addressed to any recipient, not just this
+    /// node's own network id. Needed when one socket advertises several
+    /// servers (each with its own sender id).
+    pub accept_any_recipient: bool,
 }
 
 impl Default for LanSignalerConfig {
@@ -39,6 +44,7 @@ impl Default for LanSignalerConfig {
             address_timeout: Duration::from_secs(15),
             signal_retry_interval: Duration::from_millis(500),
             signal_retries: 3,
+            accept_any_recipient: false,
         }
     }
 }

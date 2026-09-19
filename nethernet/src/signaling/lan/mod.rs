@@ -15,6 +15,7 @@ use crate::protocol::codec::NetherCodec;
 use crate::protocol::packet::discovery::{
     MessagePacket, Packets, RequestPacket, ResponsePacket, ServerData, decode, encode,
 };
+use crate::protocol::signal::SignalType;
 use crate::sans::Sans;
 use config::LanSignalerConfig;
 use error::LanSignalerError;
@@ -35,6 +36,7 @@ pub struct LanSignaler {
 
     addresses: HashMap<u64, AddressEntry>,
     discovered: HashMap<u64, ServerData>,
+    join_targets: HashMap<u64, u64>,
     pending: Vec<PendingSignal>,
     server_data: Option<ServerData>,
 
@@ -86,6 +88,7 @@ impl LanSignaler {
             config,
             addresses: HashMap::new(),
             discovered: HashMap::new(),
+            join_targets: HashMap::new(),
             pending: Vec::new(),
             server_data: None,
             last_broadcast: None,
@@ -119,6 +122,12 @@ impl LanSignaler {
     /// The signals that are still waiting to be answered.
     pub fn pending_signals(&self) -> usize {
         self.pending.len()
+    }
+
+    /// The advertised recipient id a CONNECTREQUEST offer was addressed to, if the
+    /// offer targeted an advertised server rather than this node's own network id.
+    pub fn join_target(&self, connection_id: u64) -> Option<u64> {
+        self.join_targets.get(&connection_id).copied()
     }
 
     fn handle_datagram(
@@ -155,7 +164,13 @@ impl LanSignaler {
                 }
             }
             Packets::Message(message) => {
-                if message.data == PING || message.recipient_id != self.network_id {
+                // Process signals addressed to us or, when accept_any_recipient is set,
+                // to any server we advertise (their sender ids may differ from our
+                // network id).
+                if message.data == PING
+                    || (message.recipient_id != self.network_id
+                        && !self.config.accept_any_recipient)
+                {
                     return Ok(());
                 }
 
@@ -163,6 +178,13 @@ impl LanSignaler {
                     tracing::debug!("ignoring malformed signal from {}", sender);
                     return Ok(());
                 };
+
+                if signal.signal_type == SignalType::Offer
+                    && message.recipient_id != self.network_id
+                {
+                    self.join_targets
+                        .insert(signal.connection_id, message.recipient_id);
+                }
 
                 // The remote connection answered, so nothing has to be retransmitted for it
                 self.pending.retain(|pending| {
@@ -220,7 +242,16 @@ impl LanSignaler {
             .ok_or(LanSignalerError::UnknownNetwork(target))?;
 
         let message = MessagePacket::new(target, signal.to_string());
-        let buf = encode(&Packets::Message(message), self.network_id)?;
+        // When answering a connection the remote initiated toward an advertised
+        // server (recipient != our network id), impersonate that advertised server
+        // id as the sender. The remote correlates responses by sender id and drops
+        // answers from unknown senders.
+        let sender = self
+            .join_targets
+            .get(&signal.connection_id)
+            .copied()
+            .unwrap_or(self.network_id);
+        let buf = encode(&Packets::Message(message), sender)?;
         self.output
             .push_back(LanSignalerOutput::Datagram(buf.into(), addr));
 
