@@ -78,7 +78,8 @@ impl LanSignaling {
     ) -> Result<Self> {
         socket.set_broadcast(true)?;
 
-        if config.broadcast_address.is_none() && socket.local_addr()?.port() != config.discovery_port
+        if config.broadcast_address.is_none()
+            && socket.local_addr()?.port() != config.discovery_port
         {
             config.broadcast_address = Some(SocketAddr::new(
                 Ipv4Addr::BROADCAST.into(),
@@ -145,7 +146,11 @@ impl LanSignaling {
     /// a probe sent afterwards can only record fresh answers.
     pub async fn clear_discovered(&self) {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.commands.send(Command::ClearDiscovered(reply_tx)).is_ok() {
+        if self
+            .commands
+            .send(Command::ClearDiscovered(reply_tx))
+            .is_ok()
+        {
             let _ = reply_rx.await;
         }
     }
