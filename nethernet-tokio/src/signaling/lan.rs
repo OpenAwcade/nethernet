@@ -30,6 +30,7 @@ enum Command {
     Signal(Box<Signal>, oneshot::Sender<Result<()>>),
     SetServerData(Box<ServerData>),
     Discovered(oneshot::Sender<HashMap<u64, ServerData>>),
+    ClearDiscovered(oneshot::Sender<()>),
     Address(u64, oneshot::Sender<Option<SocketAddr>>),
     JoinTarget(u64, oneshot::Sender<Option<u64>>),
 }
@@ -37,6 +38,7 @@ enum Command {
 /// LAN discovery signaling for a single NetherNet network.
 pub struct LanSignaling {
     network_id: u64,
+    socket: Arc<UdpSocket>,
     commands: mpsc::UnboundedSender<Command>,
     signal_tx: broadcast::Sender<Signal>,
     cancel_token: CancellationToken,
@@ -57,25 +59,41 @@ impl LanSignaling {
     pub async fn with_config(
         network_id: u64,
         bind_addr: SocketAddr,
-        mut config: LanConfig,
+        config: LanConfig,
     ) -> Result<Self> {
         let socket = UdpSocket::bind(bind_addr).await?;
+        Self::with_socket(network_id, socket, config).await
+    }
+
+    /// Starts the signaling on a pre-bound socket.
+    ///
+    /// Lets the caller control bind semantics (socket options, platform socket
+    /// factories, shared sockets) and keeps the socket reachable through
+    /// [`LanSignaling::socket`] for raw datagrams outside the signaling
+    /// protocol, such as proactive advertisements.
+    pub async fn with_socket(
+        network_id: u64,
+        socket: UdpSocket,
+        mut config: LanConfig,
+    ) -> Result<Self> {
         socket.set_broadcast(true)?;
 
-        if config.broadcast_address.is_none() && bind_addr.port() != config.discovery_port {
+        if config.broadcast_address.is_none() && socket.local_addr()?.port() != config.discovery_port
+        {
             config.broadcast_address = Some(SocketAddr::new(
                 Ipv4Addr::BROADCAST.into(),
                 config.discovery_port,
             ));
         }
 
+        let socket = Arc::new(socket);
         let (signal_tx, _) = broadcast::channel(100);
         let (commands, command_rx) = mpsc::unbounded_channel();
         let cancel_token = CancellationToken::new();
 
         let task = Self::drive(
             LanSignaler::new(network_id, config),
-            Arc::new(socket),
+            socket.clone(),
             command_rx,
             signal_tx.clone(),
             cancel_token.clone(),
@@ -83,6 +101,7 @@ impl LanSignaling {
 
         Ok(Self {
             network_id,
+            socket,
             commands,
             signal_tx,
             cancel_token,
@@ -96,6 +115,11 @@ impl LanSignaling {
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
+    }
+
+    /// The shared UDP socket the signaling runs on.
+    pub fn socket(&self) -> Arc<UdpSocket> {
+        self.socket.clone()
     }
 
     /// Sets the data advertised in response to discovery requests.
@@ -112,6 +136,18 @@ impl LanSignaling {
             return HashMap::new();
         }
         reply_rx.await.unwrap_or_default()
+    }
+
+    /// Clears the discovered-server table.
+    ///
+    /// Useful right before a targeted probe so that only fresh answers are
+    /// taken into account. Returns once the driver has applied the clear, so
+    /// a probe sent afterwards can only record fresh answers.
+    pub async fn clear_discovered(&self) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self.commands.send(Command::ClearDiscovered(reply_tx)).is_ok() {
+            let _ = reply_rx.await;
+        }
     }
 
     /// The address a remote network was last seen at.
@@ -225,6 +261,10 @@ impl LanSignaling {
                         }
                         Some(Command::Discovered(reply)) => {
                             let _ = reply.send(discovered.clone());
+                        }
+                        Some(Command::ClearDiscovered(reply)) => {
+                            discovered.clear();
+                            let _ = reply.send(());
                         }
                         Some(Command::Address(network_id, reply)) => {
                             let _ = reply.send(addresses.get(&network_id).copied());
