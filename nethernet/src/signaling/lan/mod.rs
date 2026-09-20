@@ -164,6 +164,10 @@ impl LanSignaler {
                 }
             }
             Packets::Message(message) => {
+                if message.data.is_empty() {
+                    return Ok(());
+                }
+
                 // Process signals addressed to us or, when accept_any_recipient is set,
                 // to any server we advertise (their sender ids may differ from our
                 // network id).
